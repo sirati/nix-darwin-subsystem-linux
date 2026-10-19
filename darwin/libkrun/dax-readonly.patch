@@ -1,0 +1,49 @@
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs	2026-10-19 10:40:25.035930379 +0200
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs	2026-10-19 10:40:25.039451905 +0200
+@@ -2701,17 +2701,13 @@
+             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+         }
+ 
+-        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+-            libc::O_RDWR
+-        } else {
+-            libc::O_RDONLY
+-        };
+-
+-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+-            libc::PROT_READ | libc::PROT_WRITE
+-        } else {
+-            libc::PROT_READ
+-        };
++        // hv_vm_map always asks for read+write+exec, so the host mapping must be
++        // writable even when the guest only reads: a PROT_READ mapping makes
++        // the guest read fault fail with SIGBUS. The guest kernel still maps it
++        // read-only on its side. A file that cannot be opened for writing gets
++        // a private mapping, which the guest then never writes to.
++        let writable = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
++        let prot_flags = libc::PROT_READ | libc::PROT_WRITE;
+ 
+         if (moffset + len) > shm_size {
+             return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
+@@ -2721,7 +2717,11 @@
+ 
+         debug!("setupmapping: ino {inode:?} guest_addr={guest_addr:x} len={len}");
+ 
+-        let file = self.open_inode(inode, open_flags)?;
++        let (file, map_flags) = match self.open_inode(inode, libc::O_RDWR) {
++            Ok(file) => (file, libc::MAP_SHARED),
++            Err(e) if writable => return Err(e),
++            Err(_) => (self.open_inode(inode, libc::O_RDONLY)?, libc::MAP_PRIVATE),
++        };
+         let fd = file.as_raw_fd();
+ 
+         let host_addr = unsafe {
+@@ -2729,7 +2729,7 @@
+                 null_mut(),
+                 len as usize,
+                 prot_flags,
+-                libc::MAP_SHARED,
++                map_flags,
+                 fd,
+                 foffset as libc::off_t,
+             )

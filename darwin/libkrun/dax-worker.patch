@@ -1,0 +1,16 @@
+--- a/src/libkrun/src/lib.rs	2026-10-19 10:35:32.662112734 +0200
++++ b/src/libkrun/src/lib.rs	2026-10-19 10:35:32.670276881 +0200
+@@ -3019,10 +3019,10 @@
+         }
+     };
+ 
++    // Not only for the GPU: virtio-fs DAX (setupmapping) also needs this worker
++    // to hv_vm_map its windows, and otherwise waits for a reply forever.
+     #[cfg(target_os = "macos")]
+-    if ctx_cfg.gpu_virgl_flags.is_some() {
+-        vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
+-    }
++    vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
+ 
+     #[cfg(target_arch = "x86_64")]
+     if ctx_cfg.vmr.split_irqchip {

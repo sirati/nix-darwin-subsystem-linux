@@ -1,0 +1,332 @@
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -1026,6 +1026,28 @@
+ int32_t krun_set_nested_virt(uint32_t ctx_id, bool enabled);
+ 
+ /**
++ * Exposes a two-cluster (big.LITTLE) CPU topology to the guest (aarch64 only).
++ *
++ * vCPUs 0..big_cpus form cluster0 (big), the remaining vCPUs form cluster1 (little).
++ * The FDT cpu nodes get "capacity-dmips-mhz" and a "cpu-map" describing both clusters.
++ * Without this call no cpu-map is generated and vCPU threads keep the default QoS.
++ *
++ * Arguments:
++ *  "ctx_id"          - the configuration context ID.
++ *  "big_cpus"        - number of vCPUs in the big cluster.
++ *  "big_capacity"    - capacity-dmips-mhz of the big vCPUs (e.g. 1024).
++ *  "little_capacity" - capacity-dmips-mhz of the little vCPUs (e.g. 400).
++ *  "big_qos"         - raw qos_class_t for the big vCPU threads (0 = leave unset).
++ *  "little_qos"      - raw qos_class_t for the little vCPU threads (0 = leave unset).
++ *                      QoS values are only applied on macOS and ignored elsewhere.
++ *
++ * Returns:
++ *  Zero on success or a negative error number on failure.
++ */
++int32_t krun_set_cpu_topology(uint32_t ctx_id, uint8_t big_cpus, uint32_t big_capacity,
++                              uint32_t little_capacity, uint32_t big_qos, uint32_t little_qos);
++
++/**
+  * Check the system if Nested Virtualization is supported
+  *
+  * Returns:
+--- a/src/arch/src/lib.rs
++++ b/src/arch/src/lib.rs
+@@ -57,6 +57,43 @@
+ /// Type for returning public functions outcome.
+ pub type Result<T> = result::Result<T, Error>;
+ 
++/// Two-cluster (big.LITTLE) CPU topology exposed to the guest.
++///
++/// vCPUs `0..big_cpus` form the big cluster, the rest the little cluster.
++/// The capacities are written to the FDT as `capacity-dmips-mhz`. The QoS
++/// values are raw macOS `qos_class_t` numbers applied to the vCPU threads
++/// (0 = leave unset); they are ignored on other hosts.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct CpuTopology {
++    pub big_cpus: u8,
++    pub big_capacity: u32,
++    pub little_capacity: u32,
++    pub big_qos: u32,
++    pub little_qos: u32,
++}
++
++impl CpuTopology {
++    pub fn is_big(&self, cpu_index: u8) -> bool {
++        cpu_index < self.big_cpus
++    }
++
++    pub fn capacity_for(&self, cpu_index: u8) -> u32 {
++        if self.is_big(cpu_index) {
++            self.big_capacity
++        } else {
++            self.little_capacity
++        }
++    }
++
++    pub fn qos_for(&self, cpu_index: u8) -> u32 {
++        if self.is_big(cpu_index) {
++            self.big_qos
++        } else {
++            self.little_qos
++        }
++    }
++}
++
+ /// Type for passing information about the initrd in the guest memory.
+ pub struct InitrdConfig {
+     /// Load address of initrd in guest memory
+--- a/src/devices/src/fdt/aarch64.rs
++++ b/src/devices/src/fdt/aarch64.rs
+@@ -13,7 +13,7 @@
+ use crate::legacy::IrqChip;
+ use crate::DeviceType;
+ use arch::aarch64::layout::{GTIMER_HYP, GTIMER_PHYS, GTIMER_SEC, GTIMER_VIRT};
+-use arch::{ArchMemoryInfo, InitrdConfig};
++use arch::{ArchMemoryInfo, CpuTopology, InitrdConfig};
+ use vm_fdt::{Error as FdtError, FdtWriter};
+ use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap};
+ 
+@@ -77,6 +77,7 @@
+     device_info: &HashMap<(DeviceType, String), T>,
+     gic_device: &IrqChip,
+     initrd: &Option<InitrdConfig>,
++    cpu_topology: &Option<CpuTopology>,
+ ) -> Result<Vec<u8>> {
+     // Alocate stuff necessary for the holding the blob.
+     let mut fdt = FdtWriter::new()?;
+@@ -95,7 +96,7 @@
+     // This is not mandatory but we use it to point the root node to the node
+     // containing description of the interrupt controller for this VM.
+     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+-    create_cpu_nodes(&mut fdt, &vcpu_mpidr)?;
++    create_cpu_nodes(&mut fdt, &vcpu_mpidr, cpu_topology)?;
+     create_memory_node(&mut fdt, guest_mem, arch_memory_info)?;
+     create_chosen_node(&mut fdt, cmdline, initrd, device_info)?;
+     create_gic_node(&mut fdt, gic_device)?;
+@@ -145,7 +146,14 @@
+ }
+ 
+ // Following are the auxiliary function for creating the different nodes that we append to our FDT.
+-fn create_cpu_nodes(fdt: &mut FdtWriter, vcpu_mpidr: &[u64]) -> Result<()> {
++// Phandles of the cpu nodes, only emitted when a CPU topology is configured.
++const CPU_PHANDLE_BASE: u32 = 0x100;
++
++fn create_cpu_nodes(
++    fdt: &mut FdtWriter,
++    vcpu_mpidr: &[u64],
++    cpu_topology: &Option<CpuTopology>,
++) -> Result<()> {
+     // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/arm/cpus.yaml.
+     let cpu_node = fdt.begin_node("cpus")?;
+     // As per documentation, on ARM v8 64-bit systems value should be set to 2.
+@@ -165,12 +173,39 @@
+         // Set the field to first 24 bits of the MPIDR - Multiprocessor Affinity Register.
+         // See http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0488c/BABHBJCI.html.
+         fdt.property_u64("reg", mpidr & 0x7FFFFF)?;
++        if let Some(topo) = cpu_topology {
++            // Linux only reads capacity-dmips-mhz while walking cpu-map, so both are needed.
++            fdt.property_u32("phandle", CPU_PHANDLE_BASE + index as u32)?;
++            fdt.property_u32("capacity-dmips-mhz", topo.capacity_for(index as u8))?;
++        }
+         fdt.end_node(cpu_name_node)?;
+     }
++    if let Some(topo) = cpu_topology {
++        create_cpu_map_node(fdt, num_cpus, topo)?;
++    }
+     fdt.end_node(cpu_node)?;
+     Ok(())
+ }
+ 
++fn create_cpu_map_node(fdt: &mut FdtWriter, num_cpus: usize, topo: &CpuTopology) -> Result<()> {
++    // See Documentation/devicetree/bindings/cpu/cpu-topology.txt in Linux.
++    let big = (topo.big_cpus as usize).min(num_cpus);
++    let clusters = [0..big, big..num_cpus];
++
++    let map_node = fdt.begin_node("cpu-map")?;
++    for (cluster_idx, cpus) in clusters.iter().filter(|c| !c.is_empty()).enumerate() {
++        let cluster_node = fdt.begin_node(&format!("cluster{cluster_idx}"))?;
++        for (core_idx, cpu) in cpus.clone().enumerate() {
++            let core_node = fdt.begin_node(&format!("core{core_idx}"))?;
++            fdt.property_u32("cpu", CPU_PHANDLE_BASE + cpu as u32)?;
++            fdt.end_node(core_node)?;
++        }
++        fdt.end_node(cluster_node)?;
++    }
++    fdt.end_node(map_node)?;
++    Ok(())
++}
++
+ fn create_memory_node(
+     fdt: &mut FdtWriter,
+     _guest_mem: &GuestMemoryMmap,
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -1924,6 +1924,35 @@
+ 
+ #[allow(clippy::missing_safety_doc)]
+ #[no_mangle]
++pub unsafe extern "C" fn krun_set_cpu_topology(
++    ctx_id: u32,
++    big_cpus: u8,
++    big_capacity: u32,
++    little_capacity: u32,
++    big_qos: u32,
++    little_qos: u32,
++) -> i32 {
++    if big_capacity == 0 || little_capacity == 0 {
++        return -libc::EINVAL;
++    }
++    match CTX_MAP.lock().unwrap().entry(ctx_id) {
++        Entry::Occupied(mut ctx_cfg) => {
++            let cfg = ctx_cfg.get_mut();
++            cfg.vmr.cpu_topology = Some(vmm::resources::CpuTopology {
++                big_cpus,
++                big_capacity,
++                little_capacity,
++                big_qos,
++                little_qos,
++            });
++            KRUN_SUCCESS
++        }
++        Entry::Vacant(_) => -libc::ENOENT,
++    }
++}
++
++#[allow(clippy::missing_safety_doc)]
++#[no_mangle]
+ pub unsafe extern "C" fn krun_check_nested_virt() -> i32 {
+     #[cfg(target_os = "macos")]
+     match hvf::check_nested_virt() {
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -902,7 +902,7 @@
+             Arc::new(Mutex::new(gic))
+         };
+ 
+-        vcpus = create_vcpus_aarch64(
++        let mut macos_vcpus = create_vcpus_aarch64(
+             &vm,
+             &vcpu_config,
+             &arch_memory_info,
+@@ -912,6 +912,12 @@
+             vm_resources.nested_enabled,
+         )
+         .map_err(StartMicrovmError::Internal)?;
++        if let Some(topo) = &vm_resources.cpu_topology {
++            for vcpu in macos_vcpus.iter_mut() {
++                vcpu.set_qos_class(topo.qos_for(vcpu.cpu_index()));
++            }
++        }
++        vcpus = macos_vcpus;
+ 
+         attach_legacy_devices(
+             &vm,
+@@ -1083,6 +1089,7 @@
+         &intc,
+         &payload_config.initrd_config,
+         &vm_resources.smbios_oem_strings,
++        &vm_resources.cpu_topology,
+     )
+     .map_err(StartMicrovmError::Internal)?;
+ 
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -274,6 +274,7 @@
+         _intc: &IrqChip,
+         initrd: &Option<InitrdConfig>,
+         _smbios_oem_strings: &Option<Vec<String>>,
++        _cpu_topology: &Option<arch::CpuTopology>,
+     ) -> Result<()> {
+         #[cfg(target_arch = "x86_64")]
+         {
+@@ -305,6 +306,7 @@
+                 self.mmio_device_manager.get_device_info(),
+                 _intc,
+                 initrd,
++                _cpu_topology,
+             )
+             .map_err(Error::SetupFDT)?;
+         }
+--- a/src/vmm/src/macos/vstate.rs
++++ b/src/vmm/src/macos/vstate.rs
+@@ -200,6 +200,8 @@
+ 
+     vcpu_list: Arc<VcpuList>,
+     nested_enabled: bool,
++    // Raw qos_class_t applied to the vCPU thread; 0 leaves it unset.
++    qos_class: u32,
+ }
+ 
+ impl Vcpu {
+@@ -293,9 +295,36 @@
+             response_sender,
+             vcpu_list,
+             nested_enabled,
++            qos_class: 0,
+         })
+     }
+ 
++    /// Sets the QoS class (raw `qos_class_t`, 0 = unset) of this vcpu's thread.
++    pub fn set_qos_class(&mut self, qos_class: u32) {
++        self.qos_class = qos_class;
++    }
++
++    fn apply_qos_class(&self) {
++        use libc::qos_class_t::*;
++        let class = match self.qos_class {
++            0 => return,
++            0x21 => QOS_CLASS_USER_INTERACTIVE,
++            0x19 => QOS_CLASS_USER_INITIATED,
++            0x15 => QOS_CLASS_DEFAULT,
++            0x11 => QOS_CLASS_UTILITY,
++            0x09 => QOS_CLASS_BACKGROUND,
++            other => {
++                warn!("vcpu {}: ignoring unknown QoS class {other:#x}", self.id);
++                return;
++            }
++        };
++        // SAFETY: only changes the scheduling class of the calling thread.
++        let ret = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
++        if ret != 0 {
++            warn!("vcpu {}: pthread_set_qos_class_self_np failed: {ret}", self.id);
++        }
++    }
++
+     /// Returns the cpu index as seen by the guest OS.
+     pub fn cpu_index(&self) -> u8 {
+         self.id
+@@ -336,6 +365,7 @@
+         let vcpu_thread = thread::Builder::new()
+             .name(format!("fc_vcpu {}", self.cpu_index()))
+             .spawn(move || {
++                self.apply_qos_class();
+                 self.init_thread_local_data()
+                     .expect("Cannot cleanly initialize vcpu TLS.");
+ 
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -28,6 +28,7 @@
+ use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+ use crate::vmm_config::vsock::*;
+ use crate::vstate::VcpuConfig;
++pub use arch::CpuTopology;
+ #[cfg(feature = "gpu")]
+ use devices::virtio::display::DisplayInfo;
+ #[cfg(feature = "tee")]
+@@ -179,6 +180,8 @@
+     pub smbios_oem_strings: Option<Vec<String>>,
+     /// Whether to enable nested virtualization.
+     pub nested_enabled: bool,
++    /// Optional big.LITTLE CPU topology exposed to the guest.
++    pub cpu_topology: Option<CpuTopology>,
+     /// Whether to enable split irqchip
+     pub split_irqchip: bool,
+     /// Do not create an implicit console device in the guest
+@@ -432,6 +435,7 @@
+             console_output: None,
+             smbios_oem_strings: None,
+             nested_enabled: false,
++            cpu_topology: None,
+             split_irqchip: false,
+             disable_implicit_console: false,
+             serial_consoles: Vec::new(),
