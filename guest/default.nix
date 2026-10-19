@@ -47,6 +47,14 @@ in
     audio.enable = lib.mkEnableOption "Mac speakers and microphones via PipeWire" // {
       default = true;
     };
+    bells = lib.mkOption {
+      type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._-]+");
+      default = [ ];
+      description = ''
+        The Mac's virtio-serial wake ports (services.linux-vm.bells there),
+        made readable and writable by `user` at /dev/virtio-ports/NAME.
+      '';
+    };
     sharedMemory.enable = lib.mkEnableOption ''
       the Mac shared memory arena at /run/host-shm/arena (a virtio-fs DAX
       mapping of a file on a Mac RAM disk: both sides map the same pages)
@@ -209,6 +217,12 @@ in
             RestartSec = 2;
           };
         };
+      })
+
+      (lib.mkIf (cfg.bells != [ ]) {
+        services.udev.extraRules = lib.concatMapStrings (name: ''
+          SUBSYSTEM=="virtio-ports", ATTR{name}=="${name}", OWNER="${cfg.user}", MODE="0600"
+        '') cfg.bells;
       })
 
       (lib.mkIf cfg.sharedMemory.enable {

@@ -7,17 +7,20 @@
 //     [--net-unixgram PATH] [--vsock PORT:PATH:listen|connect]...
 //     [--console FILE] [--log-level 0-5]
 //     [--topology BIG,BIGCAP,LITTLECAP,BIGQOS,LITTLEQOS]
-//     [--virtiofs TAG:PATH:DAX_MIB]...
+//     [--virtiofs TAG:PATH:DAX_MIB]... [--bell NAME:PREFIX]...
 //
 // Disks attach in order as vda, vdb, ...; `listen` makes the guest listen on
 // PORT with the host socket at PATH, `connect` lets the guest reach a host
 // listener at PATH.
 #include <errno.h>
+#include <fcntl.h>
 #include <libkrun.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static void check(int32_t ret, const char *what) {
   if (ret < 0) {
@@ -46,6 +49,7 @@ int main(int argc, char **argv) {
   check(krun_disable_implicit_vsock(ctx), "disable implicit vsock");
   check(krun_add_vsock(ctx, 0), "add vsock");
   int disks = 0;
+  int bells = -1;
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
     if (!strcmp(arg, "--cpus")) {
@@ -108,6 +112,47 @@ int main(int argc, char **argv) {
       *path++ = '\0';
       *size++ = '\0';
       check(krun_add_virtiofs2(ctx, spec, path, strtoull(size, NULL, 10) << 20), "add virtiofs");
+    } else if (!strcmp(arg, "--bell")) {
+      // NAME:PREFIX. A named virtio-serial port (/dev/virtio-ports/NAME in
+      // the guest) for tiny wake bytes. Its Mac ends are FIFOs, PREFIX.to-guest
+      // and PREFIX.from-guest, held open read-write here so whatever serves
+      // them can come and go without the port seeing EOF.
+      char *spec = strdup(need(argc, argv, &i));
+      char *prefix = strchr(spec, ':');
+      if (!prefix) {
+        fprintf(stderr, "linux-vm-launcher: --bell wants NAME:PREFIX\n");
+        return 2;
+      }
+      *prefix++ = '\0';
+      if (bells < 0) {
+        bells = krun_add_virtio_console_multiport(ctx);
+        check(bells, "add bell console");
+        // Port 0 of a multiport device is a console tty (hvcN); the bells
+        // want raw ports, so it gets an idle pipe and they start at port 1.
+        int idle[2];
+        if (pipe(idle)) {
+          perror("linux-vm-launcher: pipe");
+          return 1;
+        }
+        check(krun_add_console_port_inout(ctx, bells, "", idle[0], open("/dev/null", O_WRONLY)),
+              "add idle console port");
+      }
+      int fds[2];
+      const char *dirs[2] = {"to-guest", "from-guest"};
+      for (int d = 0; d < 2; d++) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s.%s", prefix, dirs[d]);
+        if (mkfifo(path, 0600) && errno != EEXIST) {
+          fprintf(stderr, "linux-vm-launcher: mkfifo %s: %s\n", path, strerror(errno));
+          return 1;
+        }
+        fds[d] = open(path, O_RDWR);
+        if (fds[d] < 0) {
+          fprintf(stderr, "linux-vm-launcher: open %s: %s\n", path, strerror(errno));
+          return 1;
+        }
+      }
+      check(krun_add_console_port_inout(ctx, bells, spec, fds[0], fds[1]), "add bell port");
     } else if (!strcmp(arg, "--console")) {
       check(krun_set_console_output(ctx, need(argc, argv, &i)), "console output");
     } else {

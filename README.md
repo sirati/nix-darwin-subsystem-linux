@@ -17,6 +17,8 @@ from nix-darwin, and integrated with macOS.
   and the guest follows the Mac's default input and output.
 - **Browser.** The guest has none: `xdg-open` and http(s) links open in a Mac
   app (Firefox by default).
+- **Bells.** Optional named virtio-serial ports for cross-side wakeups:
+  `/dev/virtio-ports/NAME` in the guest, a FIFO pair on the Mac.
 - **Shared memory.** Optional: `/run/host-shm/arena` in the guest and
   `/Volumes/<volume>/arena` on the Mac are the same pages (a virtio-fs DAX
   window onto a RAM disk file).

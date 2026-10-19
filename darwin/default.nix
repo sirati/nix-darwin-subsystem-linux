@@ -111,6 +111,7 @@ let
     gvproxy=$!
     trap 'kill $gvproxy' EXIT
     for _ in $(seq 50); do [[ -S gvproxy-vfkit.sock ]] && break; sleep 0.1; done
+    mkdir -p -m 0700 bells
     ${shmSetup}
     ${launcher}/bin/linux-vm-launcher --cpus ${toString cfg.cpus} --mem ${toString cfg.memoryMiB} \
       ${topologyArg} \
@@ -118,6 +119,7 @@ let
       --net-unixgram ${stateDir}/gvproxy-vfkit.sock \
       ${lib.concatMapStringsSep " " (a: "--vsock ${a}") vsockArgs} \
       ${lib.optionalString shm.enable "--virtiofs hostshm:${shmMount}:${toString shm.sizeMiB}"} \
+      ${lib.concatMapStringsSep " " (b: "--bell ${b}:${stateDir}/bells/${b}") cfg.bells} \
       --console ${stateDir}/console.log
   '';
 
@@ -284,6 +286,17 @@ in
         default = "1000:100";
         description = "uid:gid the guest sees as the arena's owner.";
       };
+    };
+    bells = lib.mkOption {
+      type = lib.types.listOf (lib.types.strMatching "[A-Za-z0-9._-]+");
+      default = [ ];
+      example = [ "org.example.bell.0" ];
+      description = ''
+        Named virtio-serial ports for cross-side wakeups: /dev/virtio-ports/NAME
+        in the guest, and on the Mac the FIFOs <stateDir>/bells/NAME.to-guest
+        (write to wake the guest) and NAME.from-guest (read the guest's wakes).
+        The guest needs the same names in virtualisation.macHost.bells.
+      '';
     };
     extraVsockPorts = lib.mkOption {
       default = [ ];
