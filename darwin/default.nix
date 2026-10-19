@@ -67,22 +67,35 @@ let
   ++ map (p: "${toString p.port}:${p.path}:${p.mode}") cfg.extraVsockPorts;
 
   shm = cfg.sharedMemory;
+  # Room for the filesystem beside the arena. Free: the disk only costs what
+  # is written.
+  diskMiB = shm.sizeMiB + shm.sizeMiB / 32 + 64;
+  # Changes whenever the disk must be made again.
+  diskTag = "apfs-${toString diskMiB}";
   shmSetup = lib.optionalString shm.enable ''
-    # The arena is a file on a RAM disk (an APFS file would be written back to
-    # the SSD), shared through a virtio-fs DAX window, so both sides map the
-    # same pages.
+    # The arena is a file on a RAM disk (a file on the SSD would be written
+    # back to it), shared through a virtio-fs DAX window, so both sides map
+    # the same pages. The disk is lazy, and APFS makes the arena a sparse
+    # file (HFS+ wrote every byte of it at truncate: 4 GiB of RAM). It costs
+    # what was ever written, which a RAM disk never gives back.
+    # A disk made for another size is remade here, where no VM maps it.
+    if [[ -d ${shmMount} && $(cat ${shmMount}/.size 2>/dev/null) != ${diskTag} ]]; then
+      # A Mac process still mapping the old arena keeps it, and its size.
+      /usr/bin/hdiutil detach ${shmMount} >/dev/null ||
+        echo "linux-vm: ${shmMount} is in use; keeping its old size until it is free" >&2
+    fi
     if [[ ! -d ${shmMount} ]]; then
-      dev=$(/usr/bin/hdiutil attach -nomount ram://${
-        toString (shm.sizeMiB * 2048 + 16384)
-      } | ${pkgs.coreutils}/bin/tr -d '[:space:]')
-      /usr/sbin/diskutil erasevolume HFS+ ${shm.volume} "$dev" >/dev/null
+      dev=$(/usr/bin/hdiutil attach -nomount ram://${toString (diskMiB * 2048)} | ${pkgs.coreutils}/bin/tr -d '[:space:]')
+      /usr/sbin/diskutil erasevolume APFS ${shm.volume} "$dev" >/dev/null
       touch ${shmMount}/.metadata_never_index
+      echo ${diskTag} >${shmMount}/.size
       chmod 0700 ${shmMount}
     fi
     # Kept across VM restarts rather than recreated: a RAM disk never hands
     # freed blocks back, and a crashed VM's arena may still be held, so a new
     # file would not fit. Users of the arena stamp their own run id anyway.
-    (umask 077; ${pkgs.coreutils}/bin/truncate -s ${toString shm.sizeMiB}M ${shmMount}/arena)
+    (umask 077; ${pkgs.coreutils}/bin/truncate -s ${toString shm.sizeMiB}M ${shmMount}/arena) ||
+      echo "linux-vm: the arena keeps its old size (the disk is smaller)" >&2
     # What the guest sees as owner and mode (libkrun virtio-fs override_stat).
     /usr/bin/xattr -w user.containers.override_stat ${shm.guestOwner}:0700 ${shmMount}
     /usr/bin/xattr -w user.containers.override_stat ${shm.guestOwner}:0600 ${shmMount}/arena
@@ -126,6 +139,9 @@ let
       ../guest
       {
         networking.hostName = lib.mkDefault name;
+        # <nixpkgs> and the `nixpkgs` registry entry, as lib.nixosSystem gives
+        # a flake-built system (nix-shell -p, nix run nixpkgs#...).
+        nixpkgs.flake.source = lib.mkDefault cfg.nixpkgs;
         virtualisation.macHost = {
           enable = true;
           user = lib.mkDefault cfg.user;
