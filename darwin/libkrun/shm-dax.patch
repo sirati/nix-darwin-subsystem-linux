@@ -1,0 +1,93 @@
+--- a/src/devices/src/virtio/fs/macos/passthrough.rs
++++ b/src/devices/src/virtio/fs/macos/passthrough.rs
+@@ -36,6 +36,51 @@
+ 
+ const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+ const SECURITY_CAPABILITY: &[u8] = b"security.capability\0";
++/// A file carrying this names a POSIX shared memory object; a DAX mapping of
++/// the file maps that object instead, so the host and the guest share its
++/// pages, and unlinking it on the host frees them.
++const SHM_XATTR_KEY: &[u8] = b"user.krun.shm\0";
++
++/// Attributes only the host sets. `name` has no NUL, so compare with one.
++fn reserved_xattr(name: &CStr) -> bool {
++    let n = name.to_bytes_with_nul();
++    n == XATTR_KEY || n == SHM_XATTR_KEY
++}
++
++/// The shared memory object `fd`'s file names, opened, if it names one.
++/// Only `/krun.`-prefixed names, so a file can point at nothing else.
++fn shm_of(fd: i32, write: bool) -> io::Result<Option<File>> {
++    let mut name = [0u8; 32];
++    let n = unsafe {
++        libc::fgetxattr(
++            fd,
++            SHM_XATTR_KEY.as_ptr() as *const i8,
++            name.as_mut_ptr() as *mut libc::c_void,
++            name.len() - 1,
++            0,
++            0,
++        )
++    };
++    if n < 0 {
++        let e = io::Error::last_os_error();
++        return match e.raw_os_error() {
++            Some(libc::ENOATTR) => Ok(None),
++            _ => Err(e),
++        };
++    }
++    let name = &name[..n as usize];
++    if !name.starts_with(b"/krun.") || name[1..].contains(&b'/') || name.contains(&0) {
++        return Err(io::Error::from_raw_os_error(libc::EPERM));
++    }
++    let mut cname = name.to_vec();
++    cname.push(0);
++    let oflag = if write { libc::O_RDWR } else { libc::O_RDONLY };
++    let shm = unsafe { libc::shm_open(cname.as_ptr() as *const i8, oflag) };
++    if shm < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(Some(unsafe { File::from_raw_fd(shm) }))
++}
+ 
+ const UID_MAX: u32 = u32::MAX - 1;
+ 
+@@ -2346,7 +2391,7 @@
+             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+         }
+ 
+-        if name.to_bytes() == XATTR_KEY {
++        if reserved_xattr(name) {
+             return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+         }
+ 
+@@ -2402,7 +2447,7 @@
+             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+         }
+ 
+-        if name.to_bytes() == XATTR_KEY {
++        if reserved_xattr(name) {
+             return Err(linux_error(io::Error::from_raw_os_error(libc::EACCES)));
+         }
+ 
+@@ -2529,7 +2574,7 @@
+             return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+         }
+ 
+-        if name.to_bytes() == XATTR_KEY {
++        if reserved_xattr(name) {
+             return Err(linux_error(io::Error::from_raw_os_error(
+                 bindings::LINUX_EACCES,
+             )));
+@@ -2722,6 +2767,11 @@
+             Err(e) if writable => return Err(e),
+             Err(_) => (self.open_inode(inode, libc::O_RDONLY)?, libc::MAP_PRIVATE),
+         };
++        let file = match shm_of(file.as_raw_fd(), map_flags == libc::MAP_SHARED) {
++            Ok(Some(shm)) => shm,
++            Ok(None) => file,
++            Err(e) => return Err(linux_error(e)),
++        };
+         let fd = file.as_raw_fd();
+ 
+         let host_addr = unsafe {
