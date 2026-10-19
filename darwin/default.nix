@@ -183,18 +183,21 @@ let
     done
     if [[ $("''${ssh[@]}" readlink -f /run/current-system) == "$system" ]]; then
       echo "linux-vm-switch: ${name} already runs $system"
-      exit 0
-    fi
-    if ! "''${ssh[@]}" test -e "$system"; then
-      # Not pushed by a builder: build it in the VM from the Mac's .drv.
-      if [[ ! -e ${guestSystemDrv} ]]; then
-        echo "linux-vm-switch: $system is neither in ${name} nor buildable here (no ${guestSystemDrv}); copy it in from a builder" >&2
-        exit 1
+    else
+      if ! "''${ssh[@]}" test -e "$system"; then
+        # Not pushed by a builder: build it in the VM from the Mac's .drv.
+        if [[ ! -e ${guestSystemDrv} ]]; then
+          echo "linux-vm-switch: $system is neither in ${name} nor buildable here (no ${guestSystemDrv}); copy it in from a builder" >&2
+          exit 1
+        fi
+        NIX_SSHOPTS="-i ${deployKey} ${sshOpts}" nix build --no-link --store ssh-ng://root@${name} '${guestSystemDrv}^*'
       fi
-      NIX_SSHOPTS="-i ${deployKey} ${sshOpts}" nix build --no-link --store ssh-ng://root@${name} '${guestSystemDrv}^*'
+      "''${ssh[@]}" "nix-env -p /nix/var/nix/profiles/system --set $system && $system/bin/switch-to-configuration switch"
+      echo "linux-vm-switch: ${name} switched to $system"
     fi
-    "''${ssh[@]}" "nix-env -p /nix/var/nix/profiles/system --set $system && $system/bin/switch-to-configuration switch"
-    echo "linux-vm-switch: ${name} switched to $system"
+    # Root in the VM, for postSwitch.
+    vm() { "''${ssh[@]}" "$@"; }
+    ${cfg.postSwitch}
   '';
 in
 {
@@ -308,6 +311,21 @@ in
       default = pkgs.path;
       defaultText = lib.literalExpression "pkgs.path";
       description = "The nixpkgs the guest is evaluated from.";
+    };
+    guestConfig = lib.mkOption {
+      type = lib.types.raw;
+      readOnly = true;
+      default = guest.config;
+      defaultText = lib.literalMD "the guest's evaluated `config`";
+      description = "The guest's configuration, for reading its values on the Mac side.";
+    };
+    postSwitch = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = ''
+        Shell run by linux-vm-switch (as the Mac user) once the VM runs
+        services.linux-vm.system; `vm CMD...` runs a command in it as root.
+      '';
     };
     system = lib.mkOption {
       type = lib.types.package;
