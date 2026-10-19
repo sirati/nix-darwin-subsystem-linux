@@ -24,22 +24,9 @@ let
   deployKey = "${stateDir}/deploy_ed25519";
 
   libkrun = pkgs.libkrun-efi.overrideAttrs (old: {
-    patches = (old.patches or [ ]) ++ [
-      ./libkrun/topology.patch
-      # Both upstream bugs in macOS virtio-fs DAX, needed for shared memory.
-      ./libkrun/dax-worker.patch
-      ./libkrun/dax-readonly.patch
-    ];
+    patches = (old.patches or [ ]) ++ import ./libkrun/patches.nix;
   });
-  # hv_vm_create fails unless the binary carries the hypervisor entitlement.
-  entitlements = pkgs.writeText "linux-vm-launcher.entitlements" ''
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0"><dict>
-      <key>com.apple.security.hypervisor</key><true/>
-    </dict></plist>
-  '';
-  launcher =
+  nativeLauncher =
     pkgs.runCommandCC "linux-vm-launcher"
       {
         buildInputs = [ libkrun ];
@@ -48,8 +35,10 @@ let
       ''
         mkdir -p $out/bin
         $CC -O2 -Wall -o $out/bin/linux-vm-launcher ${./launcher.c} -lkrun-efi
-        codesign --force --sign - --entitlements ${entitlements} $out/bin/linux-vm-launcher
+        # hv_vm_create fails unless the binary carries the hypervisor entitlement.
+        codesign --force --sign - --entitlements ${./launcher.entitlements} $out/bin/linux-vm-launcher
       '';
+  launcher = cfg.launcherPackage;
 
   topologyArg =
     let
@@ -79,7 +68,7 @@ let
   shmSetup = lib.optionalString shm.enable ''
     # The arena is a file on a RAM disk (an APFS file would be written back to
     # the SSD), shared through a virtio-fs DAX window, so both sides map the
-    # same pages. Fresh for every VM start.
+    # same pages.
     if [[ ! -d ${shmMount} ]]; then
       dev=$(/usr/bin/hdiutil attach -nomount ram://${
         toString (shm.sizeMiB * 2048 + 16384)
@@ -88,7 +77,9 @@ let
       touch ${shmMount}/.metadata_never_index
       chmod 0700 ${shmMount}
     fi
-    rm -f ${shmMount}/arena
+    # Kept across VM restarts rather than recreated: a RAM disk never hands
+    # freed blocks back, and a crashed VM's arena may still be held, so a new
+    # file would not fit. Users of the arena stamp their own run id anyway.
     (umask 077; ${pkgs.coreutils}/bin/truncate -s ${toString shm.sizeMiB}M ${shmMount}/arena)
     # What the guest sees as owner and mode (libkrun virtio-fs override_stat).
     /usr/bin/xattr -w user.containers.override_stat ${shm.guestOwner}:0700 ${shmMount}
@@ -187,6 +178,17 @@ in
       default = "${config.users.users.${cfg.user}.home}/.local/state/linux-vm";
       defaultText = lib.literalExpression ''"''${home}/.local/state/linux-vm"'';
       description = "Disk image, sockets, logs and the deploy key.";
+    };
+    launcherPackage = lib.mkOption {
+      type = lib.types.package;
+      default = nativeLauncher;
+      defaultText = lib.literalMD "built on the Mac from `launcher.c` and patched libkrun-efi";
+      example = lib.literalExpression "subsystem-linux.packages.x86_64-linux.launcher-aarch64-darwin";
+      description = ''
+        Provides bin/linux-vm-launcher, signed with the hypervisor entitlement.
+        The x86_64-linux flake output is the same launcher cross-built, so a
+        Linux machine can build it and the Mac only copies it.
+      '';
     };
     cpus = lib.mkOption {
       type = lib.types.ints.between 1 255;

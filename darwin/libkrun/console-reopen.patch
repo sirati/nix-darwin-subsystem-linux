@@ -1,0 +1,16 @@
+--- a/src/devices/src/virtio/console/device.rs	2026-10-19 12:29:54.325470642 +0200
++++ b/src/devices/src/virtio/console/device.rs	2026-10-19 12:29:54.328330160 +0200
+@@ -257,6 +257,13 @@
+             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+ 
++            // The guest sends PORT_OPEN on every open of the port, and a closed
++            // port keeps running here; only the first open hands it the queues.
++            if self.queues[rx_idx].is_none() || self.queues[tx_idx].is_none() {
++                log::debug!("Port {port_id} reopened, already running");
++                continue;
++            }
++
+             // Take ownership of port queues - they are moved to the port.
+             let rx_queue = self.queues[rx_idx]
+                 .take()
