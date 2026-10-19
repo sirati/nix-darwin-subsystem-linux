@@ -1,4 +1,4 @@
-# nix-macos-linux-vm
+# nix-darwin-subsystem-linux
 
 A minimal NixOS VM on Apple silicon, run by libkrun (Hypervisor.framework)
 from nix-darwin, and integrated with macOS.
@@ -27,10 +27,10 @@ There is no display path here; bring your own compositor.
 
 ```nix
 # flake inputs
-macos-linux-vm.url = "github:<owner>/nix-macos-linux-vm";
+subsystem-linux.url = "github:sirati/nix-darwin-subsystem-linux";
 
 # nix-darwin
-imports = [ inputs.macos-linux-vm.darwinModules.default ];
+imports = [ inputs.subsystem-linux.darwinModules.default ];
 services.linux-vm = {
   enable = true;
   name = "linux-vm";
@@ -39,7 +39,7 @@ services.linux-vm = {
 
 # nixosConfigurations.linux-vm
 modules = [
-  inputs.macos-linux-vm.nixosModules.default
+  inputs.subsystem-linux.nixosModules.default
   {
     networking.hostName = "linux-vm";
     system.stateVersion = "26.11";

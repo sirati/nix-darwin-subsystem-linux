@@ -248,7 +248,7 @@ in
         type = lib.types.attrsOf lib.types.str;
         default = { };
         example = {
-          macos-linux-vm = "path:/Users/me/src/nix-macos-linux-vm";
+          subsystem-linux = "path:/Users/me/src/nix-darwin-subsystem-linux";
         };
         description = "Inputs of `flake` to override when deploying (--override-input).";
       };
