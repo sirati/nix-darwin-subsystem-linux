@@ -8,6 +8,7 @@
 //     [--console FILE] [--log-level 0-5]
 //     [--topology BIG,BIGCAP,LITTLECAP,BIGQOS,LITTLEQOS]
 //     [--virtiofs TAG:PATH:DAX_MIB]... [--bell NAME:PREFIX]...
+//     [--shm-file PATH:NAME:MIB]...
 //
 // Disks attach in order as vda, vdb, ...; `listen` makes the guest listen on
 // PORT with the host socket at PATH, `connect` lets the guest reach a host
@@ -19,7 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 static void check(int32_t ret, const char *what) {
@@ -153,6 +156,45 @@ int main(int argc, char **argv) {
         }
       }
       check(krun_add_console_port_inout(ctx, bells, spec, fds[0], fds[1]), "add bell port");
+    } else if (!strcmp(arg, "--shm-file")) {
+      // PATH:NAME:MIB. Shared memory, not a file: the POSIX shared memory
+      // object NAME, made here if missing (macOS sizes one only once, so an
+      // existing one keeps its size), and PATH a sparse file of its size
+      // tagged user.krun.shm=NAME. A DAX mapping of PATH maps the object
+      // (./libkrun/shm-dax.patch), and Mac processes map it by the tag; its
+      // pages are touched lazily and freed when it is unlinked.
+      char *spec = strdup(need(argc, argv, &i));
+      char *name = strchr(spec, ':');
+      char *size = strrchr(spec, ':');
+      if (!name || name == size) {
+        fprintf(stderr, "linux-vm-launcher: --shm-file wants PATH:NAME:MIB\n");
+        return 2;
+      }
+      *name++ = '\0';
+      *size++ = '\0';
+      off_t want = (off_t)strtoull(size, NULL, 10) << 20;
+      int shm = shm_open(name, O_CREAT | O_RDWR, 0600);
+      struct stat st;
+      if (shm < 0 || fstat(shm, &st)) {
+        fprintf(stderr, "linux-vm-launcher: shm_open %s: %s\n", name, strerror(errno));
+        return 1;
+      }
+      if (st.st_size == 0 && ftruncate(shm, want)) {
+        fprintf(stderr, "linux-vm-launcher: size %s: %s\n", name, strerror(errno));
+        return 1;
+      }
+      if (st.st_size != 0 && st.st_size != want)
+        fprintf(stderr, "linux-vm-launcher: %s keeps its size, %lld MiB\n", name,
+                (long long)(st.st_size >> 20));
+      off_t have = st.st_size ? st.st_size : want;
+      close(shm);
+      int tag = open(spec, O_CREAT | O_RDWR, 0600);
+      if (tag < 0 || ftruncate(tag, have) ||
+          fsetxattr(tag, "user.krun.shm", name, strlen(name), 0, 0)) {
+        fprintf(stderr, "linux-vm-launcher: tag %s: %s\n", spec, strerror(errno));
+        return 1;
+      }
+      close(tag);
     } else if (!strcmp(arg, "--console")) {
       check(krun_set_console_output(ctx, need(argc, argv, &i)), "console output");
     } else {

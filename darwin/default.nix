@@ -18,7 +18,7 @@ let
   cfg = config.services.linux-vm;
   inherit (cfg) stateDir name;
   disk = "${stateDir}/disk.img";
-  shmMount = "/Volumes/${cfg.sharedMemory.volume}";
+  shmMount = cfg.sharedMemory.dir;
   agent = pkgs.callPackage ../agent/package.nix { };
   # socat, not libressl nc: nc outlives ssh and holds its stderr open.
   proxy = "${pkgs.socat}/bin/socat - UNIX-CONNECT:${stateDir}/ssh.sock";
@@ -67,39 +67,39 @@ let
   ++ map (p: "${toString p.port}:${p.path}:${p.mode}") cfg.extraVsockPorts;
 
   shm = cfg.sharedMemory;
-  # Room for the filesystem beside the arena. Free: the disk only costs what
-  # is written.
-  diskMiB = shm.sizeMiB + shm.sizeMiB / 32 + 64;
-  # Changes whenever the disk must be made again.
-  diskTag = "apfs-${toString diskMiB}";
+  # The arena and the files beside it, each a POSIX shared memory object; the
+  # DAX window maps all of them at once.
+  shmFiles = {
+    arena = shm.sizeMiB;
+  }
+  // shm.files;
+  totalMiB = lib.foldl' (a: b: a + b) 0 (lib.attrValues shmFiles);
   shmSetup = lib.optionalString shm.enable ''
-    # The arena is a file on a RAM disk (a file on the SSD would be written
-    # back to it), shared through a virtio-fs DAX window, so both sides map
-    # the same pages. The disk is lazy, and APFS makes the arena a sparse
-    # file (HFS+ wrote every byte of it at truncate: 4 GiB of RAM). It costs
-    # what was ever written, which a RAM disk never gives back.
-    # A disk made for another size is remade here, where no VM maps it.
-    if [[ -d ${shmMount} && $(cat ${shmMount}/.size 2>/dev/null) != ${diskTag} ]]; then
-      # A Mac process still mapping the old arena keeps it, and its size.
-      /usr/bin/hdiutil detach ${shmMount} >/dev/null ||
-        echo "linux-vm: ${shmMount} is in use; keeping its old size until it is free" >&2
-    fi
-    if [[ ! -d ${shmMount} ]]; then
-      dev=$(/usr/bin/hdiutil attach -nomount ram://${toString (diskMiB * 2048)} | ${pkgs.coreutils}/bin/tr -d '[:space:]')
-      /usr/sbin/diskutil erasevolume APFS ${shm.volume} "$dev" >/dev/null
-      touch ${shmMount}/.metadata_never_index
-      echo ${diskTag} >${shmMount}/.size
-      chmod 0700 ${shmMount}
-    fi
-    # Kept across VM restarts rather than recreated: a RAM disk never hands
-    # freed blocks back, and a crashed VM's arena may still be held, so a new
-    # file would not fit. Users of the arena stamp their own run id anyway.
-    (umask 077; ${pkgs.coreutils}/bin/truncate -s ${toString shm.sizeMiB}M ${shmMount}/arena) ||
-      echo "linux-vm: the arena keeps its old size (the disk is smaller)" >&2
+    # Shared memory, not a file system: each file in ${shmMount} is a sparse
+    # tag naming a POSIX shared memory object (the launcher's --shm-file),
+    # which the guest maps through the virtio-fs DAX window and Mac processes
+    # map by the tag, so both sides map the same pages. Pages are allocated
+    # as they are touched and freed when an object is unlinked; nothing is
+    # written to the disk.
+    mkdir -p -m 0700 ${shmMount}
+    # The RAM disk this replaced, which never gave memory back.
+    [[ -d /Volumes/linux-vm-shm ]] && /usr/bin/hdiutil detach /Volumes/linux-vm-shm >/dev/null || true
     # What the guest sees as owner and mode (libkrun virtio-fs override_stat).
     /usr/bin/xattr -w user.containers.override_stat ${shm.guestOwner}:0700 ${shmMount}
-    /usr/bin/xattr -w user.containers.override_stat ${shm.guestOwner}:0600 ${shmMount}/arena
+    ${lib.concatStrings (
+      lib.mapAttrsToList (f: _: ''
+        (umask 077; touch ${shmMount}/${f})
+        /usr/bin/xattr -w user.containers.override_stat ${shm.guestOwner}:0600 ${shmMount}/${f}
+      '') shmFiles
+    )}
   '';
+  shmArgs = lib.optionalString shm.enable (
+    lib.concatStringsSep " " (
+      lib.mapAttrsToList (
+        f: mib: "--shm-file ${shmMount}/${f}:/krun.${name}.${f}:${toString mib}"
+      ) shmFiles
+    )
+  );
 
   start = pkgs.writeShellScript "linux-vm-start" ''
     set -euo pipefail
@@ -124,7 +124,7 @@ let
       --disk ${disk} \
       --net-unixgram ${stateDir}/gvproxy-vfkit.sock \
       ${lib.concatMapStringsSep " " (a: "--vsock ${a}") vsockArgs} \
-      ${lib.optionalString shm.enable "--virtiofs hostshm:${shmMount}:${toString shm.sizeMiB}"} \
+      ${lib.optionalString shm.enable "--virtiofs hostshm:${shmMount}:${toString totalMiB}"} ${shmArgs} \
       ${lib.concatMapStringsSep " " (b: "--bell ${b}:${stateDir}/bells/${b}") cfg.bells} \
       --console ${stateDir}/console.log
   '';
@@ -376,10 +376,27 @@ in
         type = lib.types.ints.positive;
         default = 128;
       };
-      volume = lib.mkOption {
+      files = lib.mkOption {
+        type = lib.types.attrsOf lib.types.ints.positive;
+        default = { };
+        example = {
+          gpu = 1024;
+        };
+        description = ''
+          More shared memory beside the arena, name to size in MiB: each its
+          own POSIX shared memory object, tagged by a file of that name in
+          `dir`, owned by guestOwner in the guest, and mapped in the same DAX
+          window.
+        '';
+      };
+      dir = lib.mkOption {
         type = lib.types.str;
-        default = "linux-vm-shm";
-        description = "Name of the RAM disk under /Volumes holding the arena.";
+        default = "${stateDir}/shm";
+        defaultText = lib.literalExpression ''"''${stateDir}/shm"'';
+        description = ''
+          The directory shared with the guest at /run/host-shm. It holds only
+          tags: the memory is POSIX shared memory objects `/krun.<name>.<file>`.
+        '';
       };
       guestOwner = lib.mkOption {
         type = lib.types.str;

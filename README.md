@@ -19,9 +19,11 @@ from nix-darwin, and integrated with macOS.
   app (Firefox by default).
 - **Bells.** Optional named virtio-serial ports for cross-side wakeups:
   `/dev/virtio-ports/NAME` in the guest, a FIFO pair on the Mac.
-- **Shared memory.** Optional: `/run/host-shm/arena` in the guest and
-  `/Volumes/<volume>/arena` on the Mac are the same pages (a virtio-fs DAX
-  window onto a RAM disk file).
+- **Shared memory.** Optional: POSIX shared memory objects, mapped by Mac
+  processes and by the guest (`/run/host-shm/arena` and any further files)
+  through a virtio-fs DAX window, so both sides map the same pages. Pages are
+  allocated when touched and freed when an object is unlinked (a patch to
+  libkrun maps a file tagged `user.krun.shm` to the object it names).
 
 There is no display path here; bring your own compositor.
 
