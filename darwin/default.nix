@@ -1,10 +1,12 @@
 # A minimal NixOS VM on Apple silicon, run as a launchd agent of the logged-in
 # user: libkrun (Hypervisor.framework) via ./launcher.c, user-mode networking
-# via gvproxy. The guest lives in one sparse disk file and rebuilds itself, so
-# the Mac's /nix/store never holds Linux packages.
+# via gvproxy. The guest is declared inline (services.linux-vm.config) and
+# lives in one sparse disk file with its own store, so the Mac's /nix/store
+# never holds Linux packages.
 #
 #   linux-vm-bootstrap  build the first disk image (needs bootstrap.enable)
-#   linux-vm-deploy     build the guest config inside the VM and switch to it
+#   linux-vm-switch     switch the VM to services.linux-vm.system (also run
+#                       by launchd after each activation)
 #   linux-vm-ssh        shell in the VM (root via LINUX_VM_USER=root)
 {
   config,
@@ -114,14 +116,39 @@ let
       --console ${stateDir}/console.log
   '';
 
-  guestFlake = "${cfg.guest.flake}#nixosConfigurations.${cfg.guest.configuration}";
-  overrideArgs = lib.concatStrings (
-    lib.mapAttrsToList (
-      input: ref: " --override-input ${lib.escapeShellArg input} ${lib.escapeShellArg ref}"
-    ) cfg.guest.flakeOverrides
-  );
+  # The guest, evaluated as part of this configuration the way NixOS
+  # evaluates containers.<name>.config. What the Mac side already knows
+  # (name, user, bells, the arena, audio) is set for it.
+  guest = import "${cfg.nixpkgs}/nixos/lib/eval-config.nix" {
+    system = null;
+    inherit (cfg) specialArgs;
+    modules = [
+      ../guest
+      {
+        networking.hostName = lib.mkDefault name;
+        virtualisation.macHost = {
+          enable = true;
+          user = lib.mkDefault cfg.user;
+          audio.enable = lib.mkDefault cfg.audio.enable;
+          inherit (cfg) bells;
+          sharedMemory.enable = cfg.sharedMemory.enable;
+        };
+      }
+      cfg.config
+    ];
+  };
+  # Store paths without their context: the guest's closure lives on its own
+  # disk, never in the Mac's store. Something with an aarch64-linux builder
+  # puts it there, or the switch below builds it inside the VM.
+  guestSystem = builtins.unsafeDiscardStringContext cfg.system.outPath;
+  guestSystemDrv = builtins.unsafeDiscardStringContext cfg.system.drvPath;
 
   builderHostKey = (lib.head config.nix.buildMachines).publicHostKey;
+  # Only the image's .drv closure is in the Mac's store, and only while
+  # bootstrap is enabled.
+  imageDrv =
+    builtins.unsafeDiscardOutputDependency
+      (guest.extendModules { modules = [ ../guest/image.nix ]; }).config.system.build.image.drvPath;
   bootstrap = pkgs.writeShellScriptBin "linux-vm-bootstrap" ''
     set -euo pipefail
     if [[ -e ${disk} ]]; then
@@ -134,24 +161,40 @@ let
     trap 'rm -f "$knownHosts"' EXIT
     echo "linux-builder $(echo ${builderHostKey} | base64 -d)" >"$knownHosts"
     builder=(sudo ssh -i /etc/nix/builder_ed25519 -o UserKnownHostsFile="$knownHosts" builder@linux-builder)
-    image=$(sudo -H nix build --impure --no-link --print-out-paths --eval-store auto \
+    image=$(sudo -H nix build --no-link --print-out-paths \
       --store 'ssh-ng://builder@linux-builder?ssh-key=/etc/nix/builder_ed25519&base64-ssh-public-host-key=${builderHostKey}' \
-      --expr '((builtins.getFlake "${cfg.guest.flake}").nixosConfigurations.${cfg.guest.configuration}.extendModules {
-        modules = [ ${../guest/image.nix} ];
-      }).config.system.build.image')
+      '${imageDrv}^*')
     "''${builder[@]}" "cat $image/*.raw" | ${pkgs.coreutils}/bin/dd of=${disk}.tmp bs=4M conv=sparse status=none
     mv ${disk}.tmp ${disk}
     echo "${name} disk ready; the VM starts on its own" >&2
   '';
 
-  deploy = pkgs.writeShellScriptBin "linux-vm-deploy" ''
+  # Bring the running guest to services.linux-vm.system. Run by launchd after
+  # every activation (and by hand); waits for a VM that is still booting.
+  switch = pkgs.writeShellScriptBin "linux-vm-switch" ''
     set -euo pipefail
-    export NIX_SSHOPTS="-i ${deployKey} ${sshOpts}"
-    # Evaluated here, built inside the VM: only .drv files touch the Mac.
-    system=$(nix build --no-link --print-out-paths --eval-store auto \
-      --store ssh-ng://root@${name}${overrideArgs} ${guestFlake}.config.system.build.toplevel)
-    ssh -i ${deployKey} ${sshOpts} root@${name} \
-      "nix-env -p /nix/var/nix/profiles/system --set $system && $system/bin/switch-to-configuration switch"
+    system=${guestSystem}
+    ssh=(ssh -i ${deployKey} ${sshOpts} -o BatchMode=yes -o ConnectTimeout=10 root@${name})
+    [[ -e ${disk} ]] || { echo "linux-vm-switch: no disk yet (linux-vm-bootstrap)"; exit 0; }
+    for i in $(seq 60); do
+      "''${ssh[@]}" true 2>/dev/null && break
+      [[ $i == 60 ]] && { echo "linux-vm-switch: ${name} unreachable"; exit 1; }
+      sleep 5
+    done
+    if [[ $("''${ssh[@]}" readlink -f /run/current-system) == "$system" ]]; then
+      echo "linux-vm-switch: ${name} already runs $system"
+      exit 0
+    fi
+    if ! "''${ssh[@]}" test -e "$system"; then
+      # Not pushed by a builder: build it in the VM from the Mac's .drv.
+      if [[ ! -e ${guestSystemDrv} ]]; then
+        echo "linux-vm-switch: $system is neither in ${name} nor buildable here (no ${guestSystemDrv}); copy it in from a builder" >&2
+        exit 1
+      fi
+      NIX_SSHOPTS="-i ${deployKey} ${sshOpts}" nix build --no-link --store ssh-ng://root@${name} '${guestSystemDrv}^*'
+    fi
+    "''${ssh[@]}" "nix-env -p /nix/var/nix/profiles/system --set $system && $system/bin/switch-to-configuration switch"
+    echo "linux-vm-switch: ${name} switched to $system"
   '';
 in
 {
@@ -237,25 +280,46 @@ in
       default = "64G";
       description = "Size of the sparse disk file; it only takes what is used.";
     };
-    guest = {
-      flake = lib.mkOption {
-        type = lib.types.str;
-        example = "/Users/me/nix-config";
-        description = "Flake holding the guest's nixosConfiguration.";
-      };
-      configuration = lib.mkOption {
-        type = lib.types.str;
-        default = cfg.name;
-        description = "Name under nixosConfigurations.";
-      };
-      flakeOverrides = lib.mkOption {
-        type = lib.types.attrsOf lib.types.str;
-        default = { };
-        example = {
-          subsystem-linux = "path:/Users/me/src/nix-darwin-subsystem-linux";
-        };
-        description = "Inputs of `flake` to override when deploying (--override-input).";
-      };
+    config = lib.mkOption {
+      type = lib.types.deferredModule;
+      default = { };
+      example = lib.literalExpression ''
+        { pkgs, ... }: {
+          system.stateVersion = "26.11";
+          users.users.me.isNormalUser = true;
+          environment.systemPackages = [ pkgs.foot ];
+        }
+      '';
+      description = ''
+        The guest's NixOS configuration, as in `containers.<name>.config`.
+        The guest module (virtualisation.macHost) is imported and set from
+        these options; host name, user, bells, the arena and audio need not
+        be repeated.
+      '';
+    };
+    specialArgs = lib.mkOption {
+      type = lib.types.attrsOf lib.types.raw;
+      default = { };
+      example = lib.literalExpression "{ inherit inputs; }";
+      description = "Extra arguments for the guest's modules.";
+    };
+    nixpkgs = lib.mkOption {
+      type = lib.types.path;
+      default = pkgs.path;
+      defaultText = lib.literalExpression "pkgs.path";
+      description = "The nixpkgs the guest is evaluated from.";
+    };
+    system = lib.mkOption {
+      type = lib.types.package;
+      readOnly = true;
+      default = guest.config.system.build.toplevel;
+      defaultText = lib.literalMD "the guest's `system.build.toplevel`";
+      description = ''
+        The guest system. The Mac's configuration holds only its store path:
+        build it on an aarch64-linux builder and copy it into the VM
+        (`nix copy --to ssh-ng://root@<name>`), or let linux-vm-switch build
+        it inside the VM.
+      '';
     };
     browser = {
       app = lib.mkOption {
@@ -389,6 +453,14 @@ in
       StandardErrorPath = "${stateDir}/agent.log";
     };
 
+    # Reloaded, and so run, whenever the guest system changes.
+    launchd.user.agents.linux-vm-switch.serviceConfig = {
+      ProgramArguments = [ (lib.getExe switch) ];
+      RunAtLoad = true;
+      StandardOutPath = "${stateDir}/switch.log";
+      StandardErrorPath = "${stateDir}/switch.log";
+    };
+
     # A deploy key for root in the guest; the guest module needs its public
     # half (virtualisation.macHost.deployKeys).
     system.activationScripts.postActivation.text = ''
@@ -430,7 +502,7 @@ in
     '';
 
     environment.systemPackages = [
-      deploy
+      switch
       (pkgs.writeShellScriptBin "linux-vm-ssh" ''
         exec ssh ${sshOpts} "''${LINUX_VM_USER:-${cfg.user}}@${name}" "$@"
       '')
